@@ -6,8 +6,6 @@
 
 **本地小说写作桌面软件 · Local Novel Writing Desktop Application**
 
-**Version 0.8.7.3**
-
 [简体中文](#简体中文) ｜ [English](#english)
 
 </div>
