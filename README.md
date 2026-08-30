@@ -28,15 +28,15 @@ Papyrus 的设计重点不是复杂的办公功能，而是提供一个安静、
 
 ### ☀️ 白天模式
 
-![Papyrus 白天模式](screenshots/theme-day.png)
+![Papyrus 白天模式](screenshots/theme-day.jpg)
 
 ### 🌙 黑夜模式
 
-![Papyrus 黑夜模式](screenshots/theme-night.png)
+![Papyrus 黑夜模式](screenshots/theme-night.jpg)
 
 ### 🌿 护眼模式
 
-![Papyrus 护眼模式](screenshots/theme-eye-care.png)
+![Papyrus 护眼模式](screenshots/theme-eye-care.jpg)
 
 ---
 
