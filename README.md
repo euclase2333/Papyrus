@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="assets/LOGO.png" width="120" alt="Papyrus Logo" />
+<img src="assets/LOGO.png" width="1080" alt="Papyrus Logo" />
 
 # Papyrus
 
