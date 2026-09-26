@@ -433,7 +433,7 @@ pyinstaller Papyrus.spec
 下载最新版本的：
 
 ```text
-Papyrus_0.8.7.3.zip
+Papyrus.zip
 ```
 
 解压后双击：
@@ -748,7 +748,7 @@ No Python installation is required for the packaged Windows version.
 Download:
 
 ```text
-Papyrus_0.8.7.3.zip
+Papyrus.zip
 ```
 
 Extract it and run:
