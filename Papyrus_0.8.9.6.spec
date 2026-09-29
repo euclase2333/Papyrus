@@ -2,7 +2,7 @@
 
 
 a = Analysis(
-    ['Papyrus_0.8.7.3.py'],
+    ['Papyrus_0.8.9.6.py'],
     pathex=[],
     binaries=[],
     datas=[],
@@ -21,7 +21,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name='Papyrus_0.8.7.3',
+    name='Papyrus_0.8.9.6',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -41,5 +41,5 @@ coll = COLLECT(
     strip=False,
     upx=True,
     upx_exclude=[],
-    name='Papyrus_0.8.7.3',
+    name='Papyrus_0.8.9.6',
 )
