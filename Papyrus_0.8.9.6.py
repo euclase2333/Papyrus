@@ -33,7 +33,7 @@ import ui_icons
 from PySide6.QtCore import (
     Qt, QModelIndex, QAbstractItemModel, QMimeData,
     QTimer, QSize, QByteArray, QDateTime, QRectF,
-    QVariantAnimation, QEasingCurve
+    QVariantAnimation, QEasingCurve, QEvent
 )
 from PySide6.QtGui import (
     QAction, QFont, QTextCursor, QTextCharFormat,
@@ -70,13 +70,15 @@ LOGO_FILE = os.path.join(APP_DIR, "assets", "LOGO.png")
 DEFAULT_SETTINGS = {
     "theme": "day",
     "font": "Microsoft YaHei",
-    "font_size": 18,
-    "line_height": 1.6,
+    "font_size": 15,
+    "line_height": 1.5,
     "paragraph_spacing": 4,
     "editor_width": 860,
     "auto_number": False,
     "number_mode": "chapter",
     "recent_book_ids": [],
+    "open_tabs": [],
+    "active_tab_id": None,
     "today_date": "",
     "today_words": 0,
 }
@@ -100,6 +102,10 @@ class NovelNode:
         self.parent = parent
         self.created_at = created_at or datetime.now().isoformat(timespec="seconds")
         self.updated_at = updated_at or self.created_at
+        # 本章字数缓存：None 表示"还没算过/内容已变，需要重新算"。
+        # 只在 content 真正被改写的地方（NovelWriter 里两处赋值）主动清空，
+        # 避免每次统计全书字数时把没改过的章节也重新解析一遍 HTML。
+        self._word_count_cache = None
 
     def add_child(self, node, row=None):
         node.parent = self
@@ -272,14 +278,27 @@ class DataManager:
             if self.settings.get("font") in (None, "", "Georgia"):
                 self.settings["font"] = "Microsoft YaHei"
             try:
-                if int(self.settings.get("font_size", 18)) < 16:
-                    self.settings["font_size"] = 18
+                if int(self.settings.get("font_size", 15)) < 12:
+                    self.settings["font_size"] = 15
             except (TypeError, ValueError):
-                self.settings["font_size"] = 18
+                self.settings["font_size"] = 15
+            # 默认排版改回 15pt / 1.5 倍行距：把旧数据里残留的 18pt / 1.6 倍
+            # 行距也一并迁移回来，避免旧存档一直覆盖新的默认值。
+            try:
+                if int(self.settings.get("font_size", 15)) == 18:
+                    self.settings["font_size"] = 15
+            except (TypeError, ValueError):
+                pass
+            try:
+                if float(self.settings.get("line_height", 1.5)) == 1.6:
+                    self.settings["line_height"] = 1.5
+            except (TypeError, ValueError):
+                pass
 
             self._next_seq = int(data.get("next_seq", 1))
 
-            if "shelves" in data:
+            migrated = "shelves" not in data
+            if not migrated:
                 # 新格式：主文件只存“书架/书籍”索引，每本书的正文单独存一个文件。
                 self.shelves = []
                 for shelf_data in data.get("shelves", []):
@@ -305,9 +324,16 @@ class DataManager:
 
             if not self.shelves:
                 self.create_default()
+                migrated = True
 
-            # 迁移/整理后立即落盘成新格式
-            self.save()
+            # 只有真的发生了格式迁移、或者因为没有任何书架而新建了默认数据时，
+            # 才需要立即落盘——正常情况下（已经是新格式、书架也都在）每次
+            # 启动都无条件把所有书籍的正文重新序列化再整个写回磁盘一遍，是
+            # 纯浪费的开销：既没有任何内容变化，也没有東西需要迁移，等于每次
+            # 打开软件都要多读一遍、再多写一遍全部书籍的 JSON，这正是
+            # “第一次打开有点卡”的一部分来源。
+            if migrated:
+                self.save()
         except Exception:
             # 保留损坏文件，避免静默覆盖用户数据
             try:
@@ -719,6 +745,51 @@ class NovelTreeModel(QAbstractItemModel):
             node.touch()
         return True
 
+    def outdent_node(self, node):
+        """把普通章节节点提升一级：变成其上级节点的同级节点，插入在
+        上级节点之后。上级已经是书籍（即节点本身已是顶层章节）时无法
+        再提升——这是弥补拖拽只能靠鼠标精确落点、拖成子层级后很难再
+        拖回同级的问题，提供一个确定可靠的操作方式。"""
+        p = node.parent
+        if p is None or isinstance(p, (NovelBook, NovelShelf)):
+            return False
+        grandparent = p.parent
+        old_list = p.children
+        if node not in old_list:
+            return False
+        new_list = self.roots if grandparent is None else grandparent.children
+        self.beginResetModel()
+        old_list.remove(node)
+        node.parent = grandparent
+        new_list.insert(new_list.index(p) + 1, node)
+        self.endResetModel()
+        p.touch_chain()
+        if grandparent is not None:
+            grandparent.touch_chain()
+        return True
+
+    def indent_node(self, node):
+        """把普通章节节点降低一级：变成它前一个同级节点的子节点（追加
+        到其子节点末尾）。没有前一个同级节点时无法降级。"""
+        p = node.parent
+        if p is None:
+            return False
+        siblings = p.children
+        if node not in siblings:
+            return False
+        i = siblings.index(node)
+        if i == 0:
+            return False
+        new_parent = siblings[i - 1]
+        self.beginResetModel()
+        siblings.pop(i)
+        node.parent = new_parent
+        new_parent.children.append(node)
+        self.endResetModel()
+        p.touch_chain()
+        new_parent.touch_chain()
+        return True
+
 
 class SettingsDialog(QDialog):
     """排版/写作设置。使用独立的“应用”按钮，避免用户误以为点击设置没有反应。"""
@@ -751,14 +822,14 @@ class SettingsDialog(QDialog):
         self.size_combo = QComboBox()
         for x in [12, 13, 14, 15, 16, 17, 18, 20]:
             self.size_combo.addItem(f"{x} pt", x)
-        idx = self.size_combo.findData(int(settings.get("font_size", 18)))
+        idx = self.size_combo.findData(int(settings.get("font_size", 15)))
         self.size_combo.setCurrentIndex(max(0, idx))
         form.addRow("字号", self.size_combo)
 
         self.line_combo = QComboBox()
         for x in [1.2, 1.4, 1.5, 1.6, 1.8, 2.0, 2.2]:
             self.line_combo.addItem(f"{x:.1f} 倍", x)
-        idx = self.line_combo.findData(float(settings.get("line_height", 1.6)))
+        idx = self.line_combo.findData(float(settings.get("line_height", 1.5)))
         self.line_combo.setCurrentIndex(max(0, idx))
         form.addRow("行高", self.line_combo)
 
@@ -882,6 +953,83 @@ def html_to_plain(content):
     return doc.toPlainText()
 
 
+_RICHTEXT_TAG_RE = re.compile(r'<([a-zA-Z][a-zA-Z0-9]*)([^>]*?)(/?)>')
+_RICHTEXT_STYLE_ATTR_RE = re.compile(r'\sstyle="([^"]*)"')
+_RICHTEXT_CLASS_ATTR_RE = re.compile(r'\sclass="([^"]*)"')
+
+
+def compact_richtext_html(html_str):
+    """把 QTextEdit.toHtml() 生成的富文本 HTML 瘦身后再保存。
+
+    QTextEdit.toHtml() 会给几乎每一个 <p>/<span> 都重复内联一份完整的
+    style="..."（字体、字号、颜色、行高、边距等），几万字的稿子里这些
+    重复样式能占到文件体积的 80% 以上。这里把出现次数大于一次的 style
+    字符串提取成共享的 CSS class（写进 <head> 的 <style> 里），元素上
+    只留一个 class="cN" 引用；只出现一次的 style 保持原样内联，没必要
+    额外建一个 class。元素本来就带的 class（例如勾选框列表项）会被保留，
+    新 class 追加在后面。
+
+    重新用 QTextEdit/QTextDocument.setHtml() 读回时，Qt 会把 class 解析
+    成和原来完全一样的段落/字符格式，所以读写效果不受影响，只是保存到
+    磁盘上的体积明显变小。"""
+    if not html_str:
+        return html_str
+
+    freq = {}
+    for m in _RICHTEXT_TAG_RE.finditer(html_str):
+        sm = _RICHTEXT_STYLE_ATTR_RE.search(m.group(2))
+        if sm:
+            val = sm.group(1).strip()
+            if val:
+                freq[val] = freq.get(val, 0) + 1
+
+    style_to_class = {}
+    for val, count in freq.items():
+        if count > 1:
+            style_to_class[val] = f"c{len(style_to_class)}"
+
+    if not style_to_class:
+        return html_str
+
+    def replace_tag(m):
+        tag, attrs, selfclose = m.group(1), m.group(2), m.group(3)
+        sm = _RICHTEXT_STYLE_ATTR_RE.search(attrs)
+        if not sm:
+            return m.group(0)
+        cls = style_to_class.get(sm.group(1).strip())
+        if cls is None:
+            return m.group(0)
+        new_attrs = attrs[:sm.start()] + attrs[sm.end():]
+        cm = _RICHTEXT_CLASS_ATTR_RE.search(new_attrs)
+        if cm:
+            merged = f'{cm.group(1)} {cls}'.strip()
+            new_attrs = new_attrs[:cm.start()] + f' class="{merged}"' + new_attrs[cm.end():]
+        else:
+            new_attrs = new_attrs + f' class="{cls}"'
+        return f'<{tag}{new_attrs}{"/" if selfclose else ""}>'
+
+    new_html = _RICHTEXT_TAG_RE.sub(replace_tag, html_str)
+
+    css_rules = "\n".join(f".{cls} {{{val}}}" for val, cls in style_to_class.items())
+    if "<style" in new_html:
+        new_html = re.sub(
+            r'(</style>)',
+            lambda m: css_rules + "\n" + m.group(1),
+            new_html, count=1,
+        )
+    elif "<head>" in new_html:
+        new_html = new_html.replace(
+            "<head>", f'<head><style type="text/css">\n{css_rules}\n</style>', 1
+        )
+    else:
+        new_html = re.sub(
+            r'(<html[^>]*>)',
+            lambda m: m.group(1) + f'<head><style type="text/css">\n{css_rules}\n</style></head>',
+            new_html, count=1,
+        )
+    return new_html
+
+
 class NovelWriter(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -889,6 +1037,9 @@ class NovelWriter(QMainWindow):
         self.current_book = None
         self.current_node = None
         self.loading_content = False
+        # 记录"这本书这次打开/切换后，是否已经完整跑过一遍全书字数统计"
+        # ——见 update_all_stats() 里的说明。
+        self._stats_warm_book_id = None
         self.dirty = False
         self.last_saved_at = None
         self.session_start_date = date.today().isoformat()
@@ -897,14 +1048,35 @@ class NovelWriter(QMainWindow):
         self.setWindowTitle(APP_NAME)
         self.setMinimumSize(1180, 760)
         self.resize(1680, 1000)
-        self.build_ui()
-        self.apply_theme()
-        self.load_recent_book()
-
         self.save_timer = QTimer(self)
         self.save_timer.setInterval(1500)
         self.save_timer.timeout.connect(self.autosave_tick)
         self.save_timer.start()
+
+        # editor_changed() 里“toHtml() 序列化 + 全书字数递归统计”这部分
+        # 开销较大，每敲一个字都同步跑一遍会导致长文档打字卡顿。这里用
+        # 300ms 防抖定时器把这部分延迟到停止输入后再执行；标记“未保存”
+        # 这类轻量操作仍然立即完成，不受防抖影响。自动保存用独立的 1.5
+        # 秒定时器，且落盘时会直接从编辑器重新取 toHtml()，不依赖这个
+        # 防抖定时器是否已经跑过，所以不影响自动保存的及时性。
+        self.editor_change_timer = QTimer(self)
+        self.editor_change_timer.setSingleShot(True)
+        self.editor_change_timer.setInterval(300)
+        self.editor_change_timer.timeout.connect(self._apply_editor_changes)
+        self._pending_stats_node = None
+
+        self.build_ui()
+        self.apply_theme()
+        # 用 QTimer.singleShot(0, ...) 把"恢复上次的标签页/最近书籍"这一步
+        # 延后到窗口真正显示出来之后再执行（0ms 也是延后一轮事件循环，
+        # 不会有肉眼可见的延迟）。之前直接在 __init__ 里同步调用，标签页
+        # 是在主窗口第一次显示之前就加到 QTabBar 上的——这样加出来的标签
+        # 页会出现"加上了但画不出来，要等再开一个新标签页触发一次重新布局
+        # 才会显示"的问题（这是 Qt 对"还没显示过的窗口"里控件的一个常见
+        # 坑：内容加进去了，但要等窗口真正 show() 过一次、拿到有效的绘制
+        # 上下文之后才会正常刷新）。延后到窗口显示之后再加标签页，就跟用户
+        # 手动打开一个新标签页是同一种时机，不会再有这个问题。
+        QTimer.singleShot(0, self.load_recent_book)
 
     def build_ui(self):
         central = QWidget()
@@ -953,6 +1125,11 @@ class NovelWriter(QMainWindow):
         self.tree_model.set_roots(self.data.shelves)
         self.tree = QTreeView()
         self.tree.setModel(self.tree_model)
+        # 拖拽等操作内部用 beginResetModel/endResetModel 刷新整棵树，
+        # 会导致视图丢失展开状态、全部折叠收拢；这里在重置前后自动
+        # 记录/恢复各节点的展开状态，操作后层级维持原本打开的样子。
+        self.tree_model.modelAboutToBeReset.connect(self._snapshot_tree_expansion)
+        self.tree_model.modelReset.connect(self._restore_tree_expansion)
         self.tree.setHeaderHidden(True)
         self.tree.setAnimated(True)
         self.tree.setIndentation(28)
@@ -1058,6 +1235,8 @@ class NovelWriter(QMainWindow):
         self.editor.customContextMenuRequested.connect(self.show_editor_context_menu)
         self.editor.textChanged.connect(self.editor_changed)
         self.editor.cursorPositionChanged.connect(self.update_cursor)
+        self.editor.cursorPositionChanged.connect(self.update_toolbar_state)
+        self.editor.installEventFilter(self)
         self.editor.selectionChanged.connect(self.update_toolbar_state)
         self.editor.undoAvailable.connect(self.action_undo.setEnabled)
         self.editor.redoAvailable.connect(self.action_redo.setEnabled)
@@ -1213,7 +1392,7 @@ class NovelWriter(QMainWindow):
         self.font_size_combo.setObjectName("FontSizeCombo")
         self.font_size_combo.addItems(["12", "13", "14", "15", "16", "17", "18", "20", "22", "24", "28", "32"])
         self.font_size_combo.setMinimumWidth(78)
-        self.font_size_combo.setCurrentText(str(self.data.settings.get("font_size", 18)))
+        self.font_size_combo.setCurrentText(str(self.data.settings.get("font_size", 15)))
         self.font_size_combo.setToolTip("字号（pt）")
         self.font_size_combo.currentTextChanged.connect(self.toolbar_font_size_changed)
         self.toolbar.addWidget(self.font_size_combo)
@@ -1223,7 +1402,7 @@ class NovelWriter(QMainWindow):
         self.line_height_combo.setObjectName("LineHeightCombo")
         self.line_height_combo.addItems(["1.2", "1.4", "1.5", "1.6", "1.8", "2.0", "2.2"])
         self.line_height_combo.setMinimumWidth(78)
-        self.line_height_combo.setCurrentText(f'{float(self.data.settings.get("line_height", 1.6)):.1f}')
+        self.line_height_combo.setCurrentText(f'{float(self.data.settings.get("line_height", 1.5)):.1f}')
         self.line_height_combo.setToolTip("行间距（倍）")
         self.line_height_combo.currentTextChanged.connect(self.toolbar_line_height_changed)
         self.toolbar.addWidget(self.line_height_combo)
@@ -1271,8 +1450,21 @@ class NovelWriter(QMainWindow):
         self._refresh_editor_text_colors()
 
     def qss_day(self):
+        # 注意：Qt Style Sheet 的 :not() 只支持伪状态（如 :hover），不支持像
+        # QTextEdit 这样的类型选择器；"*:not(QTextEdit)" 这条规则其实从来没有
+        # 生效过（Qt 会直接忽略这条选择器无法解析的规则）。真正的界面中文字体
+        # 现在改为在 main() 里用 app.setFont(...) 统一设置——用控件字体继承来做，
+        # 不经过样式表，就不会跟正文编辑器自己维护的字体/字号打架。
+        #
+        # 重要提醒：上面这几行必须写在 return 语句之前、作为真正的 Python 注释。
+        # 之前的版本把这段说明文字直接写在了 return """ 之后——那个位置属于
+        # 三引号字符串内部，Python 不会把 "#..." 当注释处理，而是原样当成
+        # QSS 文本传给 setStyleSheet()。这几行文字里带有中文冒号、括号等
+        # 字符，会把 Qt 的 CSS 解析器搞坏，导致下面这条给工具栏下拉框单独
+        # 设置字号的规则、乃至后续的样式规则全部失效——这正是"中文界面
+        # 变成宋体"的真正原因（并非 app.setFont 没生效，而是 QSS 里一段
+        # 伪装成注释的文字把解析器带偏了）。
         return """
-        * { font-family:"Segoe UI","Microsoft YaHei","微软雅黑",sans-serif; font-size:15px; }
         #FontSizeCombo, #LineHeightCombo, #FontFamilyCombo, #ExportButton { font-size:16px; }
         QMainWindow,QWidget { background:#FFFFFF; color:#222222; }
         #TopBar,#Sidebar,QToolBar,QStatusBar { background:#F7F8FA; }
@@ -1394,8 +1586,9 @@ class NovelWriter(QMainWindow):
         """
 
     def qss_night(self):
+        # 见 qss_day() 开头的说明：这段文字必须是 Python 注释，不能写在
+        # return """ 之后（那样会被当成 QSS 内容，破坏下面的样式解析）。
         return """
-        * { font-family:"Segoe UI","Microsoft YaHei","微软雅黑",sans-serif; font-size:15px; }
         #FontSizeCombo, #LineHeightCombo, #FontFamilyCombo, #ExportButton { font-size:16px; }
         QMainWindow,QWidget { background:#111318; color:#F3F4F6; }
         #TopBar,#Sidebar,QToolBar,QStatusBar { background:#171A21; }
@@ -1517,8 +1710,9 @@ class NovelWriter(QMainWindow):
         """
 
     def qss_green(self):
+        # 见 qss_day() 开头的说明：这段文字必须是 Python 注释，不能写在
+        # return """ 之后（那样会被当成 QSS 内容，破坏下面的样式解析）。
         return """
-        * { font-family:"Segoe UI","Microsoft YaHei","微软雅黑",sans-serif; font-size:15px; }
         #FontSizeCombo, #LineHeightCombo, #FontFamilyCombo, #ExportButton { font-size:16px; }
         QMainWindow,QWidget { background:#E4F7DF; color:#2C3E50; }
         #TopBar,#Sidebar,QToolBar,QStatusBar { background:#E8F5E3; }
@@ -1699,12 +1893,12 @@ class NovelWriter(QMainWindow):
         self.editor.setTextCursor(cursor)
         self.editor.verticalScrollBar().setValue(scroll_value)
 
-    def apply_editor_settings(self):
+    def apply_editor_settings(self, reflow_paragraphs=True):
         if not hasattr(self, "editor"):
             return
         s = self.data.settings
         family = s.get("font", "Microsoft YaHei")
-        size = int(s.get("font_size", 18))
+        size = int(s.get("font_size", 15))
         font = QFont(family, size)
         self.editor.document().setDefaultFont(font)
         self.editor.setFont(font)
@@ -1712,21 +1906,124 @@ class NovelWriter(QMainWindow):
         self.editor.setMinimumWidth(0)
         self._apply_document_palette()
 
+        if reflow_paragraphs:
+            self.apply_paragraph_format()
+
+    def _paragraph_format_values(self):
+        """返回当前设置对应的 (line_height, height_type, paragraph_spacing)，
+        供 apply_paragraph_format() 和回车换段逻辑共用，避免重复算一遍。"""
+        s = self.data.settings
+        height = float(s.get("line_height", 1.5)) * 100
+        enum_obj = QTextBlockFormat.ProportionalHeight
+        try:
+            height_type = enum_obj.value
+        except AttributeError:
+            height_type = int(enum_obj)
+        margin = float(s.get("paragraph_spacing", 6))
+        return height, height_type, margin
+
+    def eventFilter(self, obj, event):
+        if obj is getattr(self, "editor", None) and event.type() == QEvent.KeyPress:
+            if event.key() in (Qt.Key_Return, Qt.Key_Enter) and not (event.modifiers() & Qt.ShiftModifier):
+                self._insert_paragraph_break()
+                return True  # 换行逻辑完全自己接管，不再交给 Qt 默认处理
+            # Ctrl+Shift+V：保留原始格式粘贴（旧的默认行为），放在标准
+            # 粘贴快捷键前面判断，避免被下面 QKeySequence.Paste 的匹配
+            # 抢先处理掉。
+            if event.key() == Qt.Key_V and (event.modifiers() & Qt.ControlModifier) \
+                    and (event.modifiers() & Qt.ShiftModifier):
+                self.editor.paste()
+                return True
+            if event.matches(QKeySequence.Paste):
+                self._paste_clean()
+                return True
+        return super().eventFilter(obj, event)
+
+    def _insert_paragraph_break(self):
+        """接管回车键的换段逻辑，替换掉 Qt 自带的默认处理。
+
+        Qt 自带处理里有一个"连续在空段落上按回车，退出列表/引用格式"的
+        功能（常见于富文本编辑器，连按两次回车跳出列表）。这个功能本身
+        合理，但 Qt 的实现方式是把整段 blockFormat 粗暴地重置成一个全新
+        的默认格式——连我们统一设置的行高、段间距也被一起清空，这就是
+        "连续换行后行间距突然失效"的真正原因。而且它对"什么时候该新建
+        段落、什么时候该原地重置"这套判断是不透明的内部状态机，之前尝试
+        在它处理完之后再"补救"格式，会跟这套状态机自己的判断打架，反而
+        导致"要连按好几次回车才能真正换行"。
+
+        这里干脆完全不让 Qt 处理回车键，改成自己手动控制段落切分：
+        - 光标在一个已经是空段落、且带有列表 / 引用缩进格式的段落上再按
+          一次回车 → 退出列表/引用，变回普通段落（保留"连按两次跳出列
+          表"这个用户习惯的操作），但普通段落的行高、段间距用当前设置
+          重新写一份，不会被清空。
+        - 其余所有情况 → 无条件新建一个段落，格式（含行高、段间距）
+          完整复制自当前段落，绝不清空，也不存在"这次按了没反应"的
+          不确定状态。"""
+        if not hasattr(self, "editor"):
+            return
+        cursor = self.editor.textCursor()
+        if cursor.hasSelection():
+            cursor.removeSelectedText()
+
+        block = cursor.block()
+        at_empty_block = not block.text()
+        text_list = block.textList()
+        block_fmt = cursor.blockFormat()
+        # quote() 会把左右 margin 设成非 0，以此识别"引用"格式
+        in_quote = block_fmt.leftMargin() > 0 or block_fmt.rightMargin() > 0
+
+        cursor.beginEditBlock()
+        if at_empty_block and (text_list is not None or in_quote):
+            if text_list is not None:
+                text_list.remove(block)
+            new_fmt = QTextBlockFormat()
+            height, height_type, margin = self._paragraph_format_values()
+            new_fmt.setLineHeight(height, height_type)
+            new_fmt.setBottomMargin(margin)
+            cursor.setBlockFormat(new_fmt)
+            cursor.setCharFormat(QTextCharFormat())
+        else:
+            char_fmt = cursor.charFormat()
+            cursor.insertBlock(block_fmt)
+            cursor.setCharFormat(char_fmt)
+        cursor.endEditBlock()
+        self.editor.setTextCursor(cursor)
+
+    def apply_paragraph_format(self):
+        """按当前设置的行高 / 段间距，重新套用到文档中的每一个段落。
+        这一步需要遍历全文所有 block，几万字的长文档开销较大，
+        只应在切换章节、切换主题、修改行高/段间距设置这类
+        "需要整篇重新排版"的场景调用；单纯改字号/字体时不要调用，
+        否则每次都要整篇遍历一遍，长文档会明显卡顿甚至卡死。
+
+        另外：editor.textChanged 连着 editor_changed()，而 editor_changed()
+        每次都会把整篇正文重新序列化成 HTML、并递归统计全书字数——如果不
+        屏蔽信号，下面循环里每改一个段落的格式都会各触发一次 textChanged，
+        几千个段落就等于把这些开销重复了几千遍，是真正卡死的原因。这里在
+        循环期间先屏蔽 editor 的信号，遍历结束后再统一触发一次即可。"""
+        if not hasattr(self, "editor"):
+            return
         doc = self.editor.document()
-        block = doc.begin()
-        while block.isValid():
-            cursor = QTextCursor(block)
-            fmt = block.blockFormat()
-            height = float(s.get("line_height", 1.6)) * 100
-            enum_obj = QTextBlockFormat.ProportionalHeight
-            try:
-                height_type = enum_obj.value
-            except AttributeError:
-                height_type = int(enum_obj)
-            fmt.setLineHeight(height, height_type)
-            fmt.setBottomMargin(float(s.get("paragraph_spacing", 6)))
-            cursor.setBlockFormat(fmt)
-            block = block.next()
+        height, height_type, margin = self._paragraph_format_values()
+        self.editor.blockSignals(True)
+        try:
+            block = doc.begin()
+            while block.isValid():
+                cursor = QTextCursor(block)
+                fmt = block.blockFormat()
+                fmt.setLineHeight(height, height_type)
+                fmt.setBottomMargin(margin)
+                cursor.setBlockFormat(fmt)
+                block = block.next()
+        finally:
+            self.editor.blockSignals(False)
+        # 循环期间信号被屏蔽，textChanged 不会自动触发，这里手动补一次，
+        # 保证正文内容同步保存、字数统计和撤销/重做按钮状态和之前一致。
+        if hasattr(self, "action_undo") and hasattr(self, "action_redo"):
+            self.action_undo.setEnabled(doc.isUndoAvailable())
+            self.action_redo.setEnabled(doc.isRedoAvailable())
+        self.editor_changed()
+
 
     # ---------- 书架 / 书籍 ----------
     def remember_recent(self, book):
@@ -1738,6 +2035,8 @@ class NovelWriter(QMainWindow):
 
     def load_recent_book(self):
         self.tree.expandAll()
+        if self._restore_open_tabs():
+            return
         ids = self.data.settings.get("recent_book_ids", [])
         target = self.data.find_book(ids[0]) if ids else None
         if not target:
@@ -1747,6 +2046,35 @@ class NovelWriter(QMainWindow):
             self.select_node(target.tree[0])
         else:
             self.select_node(target)
+
+    def _restore_open_tabs(self):
+        """启动时按上次关闭前记录的标签页列表，把当时打开的章节标签页
+        原样恢复出来，并切换到当时正在看的那一个——章节内容本身随时都
+        在，这里只是把标签页摆回去，效果类似浏览器"恢复上次的标签页"。
+        返回 True 表示恢复成功，调用方据此决定还要不要再走原来那套
+        "打开最近一本书的第一章"的默认逻辑（比如第一次启动、或者上次
+        关闭时没有任何标签页打开）。"""
+        ids = self.data.settings.get("open_tabs") or []
+        nodes = []
+        for nid in ids:
+            node = self.data.find_node(nid)
+            # find_node 是按 id 在整棵树（书架/书籍/章节）里找的，这里
+            # 只要真正的章节，书架/书籍本身不会被开成标签页。
+            if isinstance(node, NovelNode) and not isinstance(node, (NovelShelf, NovelBook)):
+                nodes.append(node)
+        if not nodes:
+            return False
+        for node in nodes:
+            self._ensure_tab_for_node(node)
+        active_id = self.data.settings.get("active_tab_id")
+        active_node = self.data.find_node(active_id) if active_id else None
+        self.select_node(active_node if active_node in nodes else nodes[-1])
+        # 保险起见再显式强制刷新一次标签栏——上面 QTimer.singleShot(0, ...)
+        # 已经把整个恢复流程挪到窗口显示之后执行，理论上不需要这一步，
+        # 但不同环境下窗口管理器处理首次显示的时机可能有细微差异，这里
+        # 加一道不依赖具体时机的保险，成本可以忽略。
+        self.tab_bar.update()
+        return True
 
     def select_first_available(self):
         if not self.data.shelves:
@@ -1933,19 +2261,175 @@ class NovelWriter(QMainWindow):
         menu.addSeparator()
         add("剪切", self.editor.cut, has_selection)
         add("复制", self.editor.copy, has_selection)
-        add("粘贴", self.editor.paste,
+        add("粘贴", self._paste_clean,
+            bool(QApplication.clipboard().mimeData().hasHtml() or QApplication.clipboard().mimeData().hasText()))
+        add("粘贴且不使用任何格式", self._paste_plain,
             bool(QApplication.clipboard().mimeData().hasText()))
-
-        def paste_plain():
-            mime = QApplication.clipboard().mimeData()
-            if mime.hasText():
-                self.editor.textCursor().insertText(mime.text())
-
-        add("粘贴且不使用任何格式",
-            paste_plain, bool(QApplication.clipboard().mimeData().hasText()))
+        add("粘贴并保留原始格式  Ctrl+Shift+V", self.editor.paste,
+            bool(QApplication.clipboard().mimeData().hasText()))
+        menu.addSeparator()
+        add("清除格式" + ("" if has_selection else "（全文）"),
+            self.clear_selection_format, True)
         menu.addSeparator()
         add("全选", self.editor.selectAll)
         self._exec_menu(menu, self.editor.mapToGlobal(pos))
+
+    def clear_selection_format(self):
+        """清除选区（没有选区时清除全文）里残留的外部格式，重置回当前
+        文档默认的字体/字号 + 统一的行高/段间距设置。
+
+        从 Word / 网页 / Google Docs 等地方粘贴进来的富文本（尤其是用了
+        "粘贴并保留原始格式"的情况），经常带着来源自己的字体、字号、
+        固定行高等格式；这些格式一来会跟本地的字号/字体調整"看起来没
+        反应"（其实是新设置盖在了这层残留格式上面，没有真正替换掉它），
+        二来因为跟文档其它地方的格式不一样、没法被 compact_richtext_html
+        识别成"重复出现、可以共享"的样式，也是保存下来的文件体积异常
+        偏大的常见原因。这里提供一个手动"洗格式"的办法：把选中的文字
+        清成跟其它正文一样的干净格式，处理完之后再保存，这部分内容占的
+        体积也会跟着降下来。"""
+        cursor = self.editor.textCursor()
+        if not cursor.hasSelection():
+            cursor.select(QTextCursor.SelectionType.Document)
+        if not cursor.hasSelection():
+            return
+
+        cursor.beginEditBlock()
+        try:
+            char_fmt = QTextCharFormat()
+            char_fmt.setFont(self.editor.document().defaultFont())
+            cursor.setCharFormat(char_fmt)  # setCharFormat 是整个替换掉，不是叠加合并
+
+            height, height_type, margin = self._paragraph_format_values()
+            doc = self.editor.document()
+            start_block = doc.findBlock(cursor.selectionStart())
+            end_block = doc.findBlock(cursor.selectionEnd())
+            block = start_block
+            while block.isValid():
+                block_cursor = QTextCursor(block)
+                fmt = QTextBlockFormat()
+                fmt.setLineHeight(height, height_type)
+                fmt.setBottomMargin(margin)
+                block_cursor.setBlockFormat(fmt)
+                if block == end_block:
+                    break
+                block = block.next()
+        finally:
+            cursor.endEditBlock()
+
+        self.save_current()
+        self.set_dirty(True)
+
+    def _paste_clean(self):
+        """默认的粘贴行为：保留来源里"加粗 / 斜体 / 下划线 / 删除线"这几个
+        工具栏本身就能控制的基础格式，但不带入字体、字号、颜色、行高、
+        段间距这些——这些正是导致"粘贴进来的文字改不了格式"（其实不是
+        改不动，是新设置盖在了这层残留格式上面，没有真正替换掉它）和
+        文件体积异常偏大的东西。段落统一套用当前文档的行高/段间距设置，
+        不沿用来源自己的 margin / line-height。
+
+        需要完全不带任何格式的话，用右键菜单"粘贴且不使用任何格式"；
+        需要连字体颜色行高都原样保留的话，用"粘贴并保留原始格式"
+        （或 Ctrl+Shift+V）。"""
+        mime = QApplication.clipboard().mimeData()
+        if mime.hasHtml():
+            source_doc = QTextDocument()
+            source_doc.setHtml(mime.html())
+            self._insert_matched_format(source_doc)
+        elif mime.hasText():
+            self.editor.textCursor().insertText(mime.text())
+
+    def _insert_matched_format(self, source_doc):
+        """把 source_doc（剪贴板 HTML 解析出来的临时文档）的内容插入到
+        编辑器里：
+        - 字符格式：逐个格式片段（fragment）只保留加粗/斜体/下划线/
+          删除线这几个属性，字体、字号、颜色等一律不带。
+        - 段落格式：普通段落统一用当前文档的行高/段间距设置，不沿用
+          来源自己的段落格式；引用（有缩进、但不在列表里的段落，对应
+          <blockquote>）套用跟工具栏"引用"按钮（quote()）一致的缩进；
+          无序/有序列表按来源的列表样式重新建一份列表（不沿用来源
+          自己的列表 css，只区分"有序/无序"这一种语义），连续的列表项
+          会加进同一个列表对象，不会拆成一堆各自一项的列表。"""
+        # 跟 quote() 按钮用的是同一组数值，保持"手动点引用按钮"和
+        # "粘贴进来的引用"视觉效果一致。
+        QUOTE_MARGINS = dict(left=28, right=20, top=6, bottom=6)
+        ORDERED_LIST_STYLES = (
+            QTextListFormat.ListDecimal, QTextListFormat.ListLowerAlpha,
+            QTextListFormat.ListUpperAlpha, QTextListFormat.ListLowerRoman,
+            QTextListFormat.ListUpperRoman,
+        )
+
+        cursor = self.editor.textCursor()
+        cursor.beginEditBlock()
+        try:
+            if cursor.hasSelection():
+                cursor.removeSelectedText()
+            height, height_type, margin = self._paragraph_format_values()
+            block = source_doc.begin()
+            first_block = True
+            prev_source_list = None
+            dest_list = None
+            while block.isValid():
+                src_bf = block.blockFormat()
+                src_list = block.textList()
+                is_quote = src_list is None and (src_bf.leftMargin() > 0 or src_bf.rightMargin() > 0)
+
+                if not first_block:
+                    block_fmt = QTextBlockFormat()
+                    block_fmt.setLineHeight(height, height_type)
+                    block_fmt.setBottomMargin(margin)
+                    if is_quote:
+                        block_fmt.setLeftMargin(QUOTE_MARGINS["left"])
+                        block_fmt.setRightMargin(QUOTE_MARGINS["right"])
+                        block_fmt.setTopMargin(QUOTE_MARGINS["top"])
+                        block_fmt.setBottomMargin(QUOTE_MARGINS["bottom"])
+                    cursor.insertBlock(block_fmt)
+                elif is_quote:
+                    # 粘贴的第一段是引用：直接把光标当前所在的段落改成
+                    # 引用样式，不需要先插入新段落。
+                    block_fmt = cursor.blockFormat()
+                    block_fmt.setLeftMargin(QUOTE_MARGINS["left"])
+                    block_fmt.setRightMargin(QUOTE_MARGINS["right"])
+                    block_fmt.setTopMargin(QUOTE_MARGINS["top"])
+                    block_fmt.setBottomMargin(QUOTE_MARGINS["bottom"])
+                    cursor.setBlockFormat(block_fmt)
+                first_block = False
+
+                if src_list is not None:
+                    if src_list is prev_source_list and dest_list is not None:
+                        # 跟上一段是来源里同一个列表，加进同一个目标列表，
+                        # 不要每段各建一个新列表。
+                        dest_list.add(cursor.block())
+                    else:
+                        is_ordered = src_list.format().style() in ORDERED_LIST_STYLES
+                        list_style = QTextListFormat.ListDecimal if is_ordered else QTextListFormat.ListDisc
+                        dest_list = cursor.createList(list_style)
+                else:
+                    dest_list = None
+                prev_source_list = src_list
+
+                it = block.begin()
+                while not it.atEnd():
+                    frag = it.fragment()
+                    if frag.isValid() and frag.text():
+                        src_fmt = frag.charFormat()
+                        clean_fmt = QTextCharFormat()
+                        clean_fmt.setFontWeight(QFont.Bold if src_fmt.fontWeight() >= QFont.Bold else QFont.Normal)
+                        clean_fmt.setFontItalic(src_fmt.fontItalic())
+                        clean_fmt.setFontUnderline(src_fmt.fontUnderline())
+                        clean_fmt.setFontStrikeOut(src_fmt.fontStrikeOut())
+                        cursor.insertText(frag.text(), clean_fmt)
+                    it += 1
+                block = block.next()
+        finally:
+            cursor.endEditBlock()
+        self.editor.setTextCursor(cursor)
+
+    def _paste_plain(self):
+        """粘贴且不使用任何格式：只取剪贴板里的纯文本，格式完全交给光标
+        当前位置的格式决定，跟旧版本行为一致。"""
+        mime = QApplication.clipboard().mimeData()
+        if mime.hasText():
+            self.editor.textCursor().insertText(mime.text())
 
     def tree_selection(self, current, previous):
         if self.loading_content or not current.isValid():
@@ -1978,9 +2462,39 @@ class NovelWriter(QMainWindow):
         self.loading_content = False
         self.editor_title.setText(self.display_title(node))
         self.apply_editor_settings()
+
+        # 修复"切换/新建章节后，打字字号莫名其妙沿用上一章节"的根本问题：
+        # QTextEdit 内部维护着一个"接下来打字要用的字符格式"
+        # （currentCharFormat，跟光标当前位置实际的字符格式是两回事），
+        # setHtml() 切换整篇文档内容时 Qt 并不会自动重置这个状态——哪怕
+        # 切到了一篇全新的空白章节，只要之前在别的章节里通过工具栏改过
+        # 字号/字体（尤其是全选后改，或者光标停在文档末尾时改的那次），
+        # 这个"打字格式"就会原样带过来，表现为："新建章节明明没设过格式，
+        # 一打字字号却很小/很奇怪，选中了改字号看起来又没反应"——其实不是
+        # 改不动，而是每次新打的字都被这个残留状态接管了。这里用一个*不
+        # 应用到编辑器上*的独立游标去读取文档开头真实解析出来的格式（而
+        # 不是随便写死一个值），重置"打字格式"，顺带清掉上一章节可能
+        # 残留的粗体/斜体等状态；用独立游标是为了不影响下面要恢复的
+        # 光标位置和滚动条位置——以前这里直接 setTextCursor() 把光标
+        # 移到开头，代价是每次切换标签页都会跳回文档最顶部。
+        probe_cursor = QTextCursor(self.editor.document())
+        probe_cursor.movePosition(QTextCursor.MoveOperation.Start)
+        self.editor.setCurrentCharFormat(probe_cursor.charFormat())
+
+        # 恢复上次切换走时停留的光标位置和滚动条位置（第一次打开这一章节
+        # 则都还没记录过，默认停在开头），实现"切换标签页时停留在原来的
+        # 位置"，跟浏览器标签页的体验保持一致。
+        cursor = self.editor.textCursor()
+        max_pos = max(0, self.editor.document().characterCount() - 1)
+        saved_pos = min(getattr(node, "_cursor_pos", 0), max_pos)
+        cursor.setPosition(max(0, saved_pos))
+        self.editor.setTextCursor(cursor)
+        self.editor.verticalScrollBar().setValue(getattr(node, "_scroll_value", 0))
+
         self.set_dirty(False)
         self.update_all_stats()
         self._activate_tab_for_node(node)
+        self.update_toolbar_state()
 
     # ---------- 章节标签页（Chrome / Edge 风格，可同时打开多个章节） ----------
     def _find_tab_index(self, node):
@@ -2166,6 +2680,49 @@ class NovelWriter(QMainWindow):
             self.select_node(node)
             self.refresh_auto_titles()
 
+    def outdent_node(self, node):
+        self.save_current()
+        if self.tree_model.outdent_node(node):
+            self.data.save()
+            self.tree.expand(self.tree_model.index_for_node(node.parent) if node.parent else QModelIndex())
+            self.select_node(node)
+            self.refresh_auto_titles()
+
+    def indent_node(self, node):
+        self.save_current()
+        if self.tree_model.indent_node(node):
+            self.data.save()
+            self.tree.expand(self.tree_model.index_for_node(node.parent))
+            self.select_node(node)
+            self.refresh_auto_titles()
+
+    def _snapshot_tree_expansion(self):
+        """在 tree_model 被 reset 之前，记录当前哪些节点是展开状态。"""
+        self._expanded_node_ids = set()
+
+        def rec(nodes):
+            for n in nodes:
+                idx = self.tree_model.index_for_node(n)
+                if idx.isValid() and self.tree.isExpanded(idx):
+                    self._expanded_node_ids.add(n.id)
+                rec(n.children)
+        rec(self.tree_model.roots)
+
+    def _restore_tree_expansion(self):
+        """tree_model reset 完成后，把之前记录的展开状态还原回去。"""
+        ids = getattr(self, "_expanded_node_ids", None)
+        if not ids:
+            return
+
+        def rec(nodes):
+            for n in nodes:
+                if n.id in ids:
+                    idx = self.tree_model.index_for_node(n)
+                    if idx.isValid():
+                        self.tree.expand(idx)
+                rec(n.children)
+        rec(self.tree_model.roots)
+
     def tree_menu(self, pos):
         idx = self.tree.indexAt(pos)
         menu = QMenu(self)
@@ -2214,6 +2771,8 @@ class NovelWriter(QMainWindow):
                 menu.addSeparator()
                 a5 = menu.addAction("上移")
                 a6 = menu.addAction("下移")
+                a8 = menu.addAction("提升层级（变为上级的同级）")
+                a9 = menu.addAction("降低层级（变为上一节点的子级）")
                 menu.addSeparator()
                 a7 = menu.addAction("复制标题")
                 chosen = self._exec_menu(menu, self.tree.viewport().mapToGlobal(pos))
@@ -2223,6 +2782,8 @@ class NovelWriter(QMainWindow):
                 elif chosen == a4: self.delete_node(node)
                 elif chosen == a5: self.move_node(node, -1)
                 elif chosen == a6: self.move_node(node, 1)
+                elif chosen == a8: self.outdent_node(node)
+                elif chosen == a9: self.indent_node(node)
                 elif chosen == a7: QApplication.clipboard().setText(node.title)
         else:
             a = menu.addAction("新建书架…")
@@ -2277,16 +2838,42 @@ class NovelWriter(QMainWindow):
     def editor_changed(self):
         if self.loading_content or not self.current_node:
             return
-        self.current_node.content = self.editor.toHtml()
-        self.current_node.touch_chain()
+        # 轻量操作：立即执行，敲字时不应有延迟。
         self.mark_dirty()
+        # 重量操作（toHtml() 序列化 + 全书字数递归统计）：防抖延迟执行，
+        # 避免每敲一个字都同步跑一遍导致长文档打字卡顿。
+        self._pending_stats_node = self.current_node
+        self.editor_change_timer.start()
+
+    def _apply_editor_changes(self):
+        node = self._pending_stats_node
+        # 防抖等待期间可能已经切换到了别的节点（虽然切换前 save_current()
+        # 已经同步落过一次内容），保险起见这里仍做一次一致性检查，避免把
+        # 当前编辑器内容误写回一个已经不在编辑的旧节点。
+        if not node or node is not self.current_node:
+            return
+        self.current_node.content = self.editor.toHtml()
+        self.current_node._word_count_cache = None
+        self.current_node.touch_chain()
         self.update_all_stats()
 
     def save_current(self):
         if not self.current_node:
             return
-        self.current_node.content = self.editor.toHtml()
+        # 记录离开这一章节时光标和滚动条停在哪，切回这个标签页时能恢复到
+        # 原来的浏览位置，而不是每次都跳回顶部——体验上和浏览器标签页
+        # 保持一致。这两个值只在内存里，不写入 JSON，重启后不需要保留。
+        self.current_node._cursor_pos = self.editor.textCursor().position()
+        self.current_node._scroll_value = self.editor.verticalScrollBar().value()
+        # 只在真正落盘保存时瘦身 HTML；editor_changed() 里的内存态赋值
+        # 每次按键都会触发，不做瘦身处理，避免增加输入时的开销。
+        self.current_node.content = compact_richtext_html(self.editor.toHtml())
+        self.current_node._word_count_cache = None
         self.current_node.touch_chain()
+        # 这里已经把最新内容同步落到 current_node 上了，防抖定时器里
+        # 待执行的那次同步（如果还没到点）就不需要再跑一遍。
+        self.editor_change_timer.stop()
+        self._pending_stats_node = None
         self._save_now()
 
     def mark_dirty(self):
@@ -2303,6 +2890,7 @@ class NovelWriter(QMainWindow):
             self.save_state.setText(f"● 已保存 {stamp}")
 
     def _save_now(self):
+        self._save_open_tabs()
         if self.data.save():
             self.dirty = False
             self.last_saved_at = now_string()
@@ -2310,6 +2898,20 @@ class NovelWriter(QMainWindow):
         else:
             self.dirty = True
             self.save_state.setText("● 保存失败")
+
+    def _save_open_tabs(self):
+        """记录当前打开的所有标签页和正在看的那一个，下次启动时据此原样
+        恢复出来，效果类似浏览器"恢复上次的标签页"。放在 _save_now() 里
+        （落盘保存、含自动保存、退出前保存）而不是只在退出时存一次，是
+        为了万一程序被强制结束（比如崩溃、断电），标签页列表也基本是
+        最新的，不会因为没走到正常退出流程就丢失。这两个只是节点 id 的
+        列表，读写开销可以忽略。"""
+        self.data.settings["open_tabs"] = [
+            self.tab_bar.tabData(i).id
+            for i in range(self.tab_bar.count())
+            if self.tab_bar.tabData(i) is not None
+        ]
+        self.data.settings["active_tab_id"] = self.current_node.id if self.current_node else None
 
     def autosave_tick(self):
         if self.dirty:
@@ -2372,7 +2974,7 @@ class NovelWriter(QMainWindow):
         else:
             f = QTextCharFormat()
             f.setFontWeight(QFont.Normal)
-            f.setFontPointSize(float(self.data.settings.get("font_size", 18)))
+            f.setFontPointSize(float(self.data.settings.get("font_size", 15)))
             c.mergeCharFormat(f)
         self.editor.setFocus()
 
@@ -2389,7 +2991,7 @@ class NovelWriter(QMainWindow):
         f.setFontUnderline(False)
         f.setFontStrikeOut(False)
         f.setFontFamily(self.data.settings.get("font", "Microsoft YaHei"))
-        f.setFontPointSize(float(self.data.settings.get("font_size", 18)))
+        f.setFontPointSize(float(self.data.settings.get("font_size", 15)))
         c.mergeCharFormat(f)
         bf = c.blockFormat()
         bf.setHeadingLevel(0)
@@ -2409,9 +3011,19 @@ class NovelWriter(QMainWindow):
         else:
             self.editor.mergeCurrentCharFormat(fmt)
 
-        # 工具栏字体样式同时作为新的默认正文字体。
-        self.data.settings["font"] = family
-        self.apply_editor_settings()
+        # 注意：这里不能把 family 写回 self.data.settings["font"]，也不能调用
+        # apply_editor_settings()。原因有两层：
+        # 1) apply_editor_settings() 内部会执行 self.editor.document().setDefaultFont(...)
+        #    / self.editor.setFont(...)，这两个调用作用于整篇文档而不是当前选区，会把
+        #    选区之外、原本依赖"文档默认字体"渲染的文字也一起改掉字体。
+        # 2) self.data.settings["font"] 是"新建正文"的全局默认值。之前的版本会在这里
+        #    顺手把它改成当前选区的字体，看似方便，实际效果是：只要在任意一篇文章里
+        #    改过一次选区字体，之后新建的所有章节都会莫名其妙变成那次顺手选的字体/
+        #    很小的字号——这正是"新建文本字体很小、改了又改不动"那个 bug 的根源
+        #    （其实字体是能改的，只是"新建正文的默认字体"被不知不觉带偏了）。
+        # 改字体只应该影响当前选区（或没有选区时，影响接下来要输入的文字），
+        # 不应该影响文档默认字体，也不应该影响"新建正文"的全局默认设置——
+        # 全局默认字体/字号只应该由（目前隐藏的）设置面板来改。
         self.save_current()
         self.set_dirty(True)
 
@@ -2430,9 +3042,12 @@ class NovelWriter(QMainWindow):
         else:
             self.editor.mergeCurrentCharFormat(fmt)
 
-        # 工具栏字号同时作为新的默认正文大小。
-        self.data.settings["font_size"] = size
-        self.apply_editor_settings()
+        # 同上（见 toolbar_font_family_changed 的注释）：这里既不能调用
+        # apply_editor_settings()，也不能把 size 写回 self.data.settings["font_size"]，
+        # 否则会把"新建正文"的全局默认字号悄悄改成这次选区临时用的字号，导致下次
+        # 新建的章节继承一个意料之外（可能很小）的默认字号。改字号只应该作用于
+        # 选区（或没有选区时，作用于接下来要输入的文字），全局默认字号只应该由
+        # （目前隐藏的）设置面板来改。
         self.save_current()
         self.set_dirty(True)
 
@@ -2442,14 +3057,139 @@ class NovelWriter(QMainWindow):
         except (TypeError, ValueError):
             return
 
-        # 工具栏行间距同时作为新的默认正文行高，直接套用到整篇文档。
-        self.data.settings["line_height"] = height
-        self.apply_editor_settings()
+        cursor = self.editor.textCursor()
+        if cursor.hasSelection():
+            # 有选区：只改选区覆盖到的段落，不动全局默认行高、也不影响
+            # 选区之外的其它段落——跟上面改字号/字体是同一个道理（见
+            # toolbar_font_size_changed 的注释）：不能把这次选区的临时
+            # 调整，顺手写回"新建正文"的全局默认设置。
+            self._apply_line_height_to_selection(cursor, height)
+        else:
+            # 没有选区：维持原来的行为，工具栏行间距同时作为新的默认
+            # 正文行高，直接套用到整篇文档。
+            self.data.settings["line_height"] = height
+            self.apply_editor_settings()
         self.save_current()
         self.set_dirty(True)
 
+    def _apply_line_height_to_selection(self, cursor, height):
+        """把行高只应用到选区覆盖到的段落（含首尾两端不完整选中的段落），
+        用 beginEditBlock/endEditBlock 包起来，撤销时是一步到位，不会
+        选区跨了 5 个段落却要按 5 次撤销。"""
+        height_type = QTextBlockFormat.ProportionalHeight
+        try:
+            height_type = height_type.value
+        except AttributeError:
+            height_type = int(height_type)
+
+        doc = self.editor.document()
+        start_block = doc.findBlock(cursor.selectionStart())
+        end_block = doc.findBlock(cursor.selectionEnd())
+
+        edit_cursor = QTextCursor(doc)
+        edit_cursor.beginEditBlock()
+        try:
+            block = start_block
+            while block.isValid():
+                block_cursor = QTextCursor(block)
+                fmt = block.blockFormat()
+                fmt.setLineHeight(height * 100, height_type)
+                block_cursor.setBlockFormat(fmt)
+                if block == end_block:
+                    break
+                block = block.next()
+        finally:
+            edit_cursor.endEditBlock()
+
+    def _selection_char_format_values(self, cursor):
+        """收集选区（无选区时为光标所在处）内出现过的字号 / 字体集合。
+        按格式片段（fragment）遍历而不是逐字符遍历，几万字的选区也不会
+        变慢；一旦字号和字体都已经出现分歧，立刻提前结束，不用扫完整个
+        选区。"""
+        if not cursor.hasSelection():
+            font = cursor.charFormat().font()
+            return {round(font.pointSizeF(), 1)}, {font.family()}
+
+        doc = self.editor.document()
+        start, end = cursor.selectionStart(), cursor.selectionEnd()
+        sizes, families = set(), set()
+        block = doc.findBlock(start)
+        last_block = doc.findBlock(max(start, end - 1))
+        while block.isValid():
+            it = block.begin()
+            while not it.atEnd():
+                frag = it.fragment()
+                if frag.isValid():
+                    frag_start = frag.position()
+                    frag_end = frag_start + frag.length()
+                    if frag_end > start and frag_start < end:
+                        font = frag.charFormat().font()
+                        sizes.add(round(font.pointSizeF(), 1))
+                        families.add(font.family())
+                        if len(sizes) > 1 and len(families) > 1:
+                            return sizes, families
+                it += 1
+            if block == last_block:
+                break
+            block = block.next()
+        return sizes, families
+
+    def _selection_line_heights(self, cursor):
+        """收集选区跨越的所有段落的行高（按段落/block 遍历，段落数通常
+        远小于字符数，不会有性能问题）。"""
+        doc = self.editor.document()
+        if not cursor.hasSelection():
+            lh = cursor.blockFormat().lineHeight()
+            return {round(lh / 100.0, 2) if lh else None}
+        start, end = cursor.selectionStart(), cursor.selectionEnd()
+        block = doc.findBlock(start)
+        last_block = doc.findBlock(max(start, end - 1))
+        heights = set()
+        while block.isValid():
+            lh = block.blockFormat().lineHeight()
+            heights.add(round(lh / 100.0, 2) if lh else None)
+            if len(heights) > 1:
+                return heights
+            if block == last_block:
+                break
+            block = block.next()
+        return heights
+
     def update_toolbar_state(self):
-        pass
+        """让工具栏的字体 / 字号 / 行间距下拉框实时显示当前选区（或光标
+        所在处）的实际格式，效果类似 Word：如果选区内存在多种不同的
+        值，则对应下拉框显示为空白，而不是随便显示其中一种。"""
+        if not hasattr(self, "editor") or not hasattr(self, "font_size_combo"):
+            return
+        cursor = self.editor.textCursor()
+
+        sizes, families = self._selection_char_format_values(cursor)
+        heights = self._selection_line_heights(cursor)
+
+        self.font_size_combo.blockSignals(True)
+        if len(sizes) == 1:
+            size = next(iter(sizes))
+            text = str(int(size)) if size == int(size) else f"{size:g}"
+            self.font_size_combo.setCurrentIndex(self.font_size_combo.findText(text))
+        else:
+            self.font_size_combo.setCurrentIndex(-1)
+        self.font_size_combo.blockSignals(False)
+
+        self.font_family_combo.blockSignals(True)
+        if len(families) == 1:
+            family = next(iter(families))
+            self.font_family_combo.setCurrentIndex(self.font_family_combo.findText(family))
+        else:
+            self.font_family_combo.setCurrentIndex(-1)
+        self.font_family_combo.blockSignals(False)
+
+        self.line_height_combo.blockSignals(True)
+        if len(heights) == 1 and next(iter(heights)) is not None:
+            text = f"{next(iter(heights)):.1f}"
+            self.line_height_combo.setCurrentIndex(self.line_height_combo.findText(text))
+        else:
+            self.line_height_combo.setCurrentIndex(-1)
+        self.line_height_combo.blockSignals(False)
 
     # ---------- 设置 ----------
     def open_settings(self):
@@ -2480,7 +3220,17 @@ class NovelWriter(QMainWindow):
         return len("".join(text.split()))
 
     def node_words(self, node):
-        return self.count_text(html_to_plain(node.content))
+        # 全书字数统计 book_words() 会对树上每个节点都调用一次这个方法；
+        # 之前每次都用 QTextDocument 重新解析一遍 HTML，即使这一章内容
+        # 根本没变过。几百 KB、几百章的书，每次统计全书字数（切换章节、
+        # 甚至打字停顿 300ms 后都会触发一次）就要把全书 HTML 重新解析一
+        # 遍，这才是"打开/使用越用越慢"的真正原因。这里按章节缓存字数，
+        # 只有 content 真正被改写时才会失效重新算（见 _word_count_cache
+        # 的清空位置），没改过的章节直接用缓存，全书统计从 O(全书字数)
+        # 降到只需重新算"真正变过的那一小部分"。
+        if node._word_count_cache is None:
+            node._word_count_cache = self.count_text(html_to_plain(node.content))
+        return node._word_count_cache
 
     def book_words(self):
         total = 0
@@ -2495,6 +3245,27 @@ class NovelWriter(QMainWindow):
 
     def update_all_stats(self):
         chapter = self.node_words(self.current_node) if self.current_node else 0
+
+        book_id = self.current_book.id if self.current_book else None
+        if book_id is not None and self._stats_warm_book_id != book_id:
+            # 这本书这次打开/切换后，还没完整跑过一遍全书字数统计——每一章
+            # 都要真的用 QTextDocument 解析一遍 HTML 才能拿到字数（之后就会
+            # 命中每章各自的缓存，只有真正改过内容的章节才会重新解析，见
+            # node_words() 的说明），这一整遍集中发生在刚打开/切换书籍的
+            # 那一下，章节多、单章内容大（尤其是历史上粘贴进来、格式比较
+            # 重的章节）就会觉得"刚打开有点卡"。这里先把当前章节的字数、
+            # 状态栏正常显示出来，全书总字数改成放到下一轮事件循环里再
+            # 算——不会卡住这次调用，用户能立刻看到内容和光标，全书总字数
+            # 会在几乎感觉不到的延迟后自动补上。
+            self._stats_warm_book_id = book_id
+            self.word_label.setText(f"本章 {chapter:,}  ·  全文统计中…")
+            if self.current_node:
+                self.node_status.setText(f"当前：{self.display_title(self.current_node)}")
+            else:
+                self.node_status.setText("未选择节点")
+            QTimer.singleShot(0, self.update_all_stats)
+            return
+
         total = self.book_words() if self.current_book else 0
 
         settings = self.data.settings
@@ -2579,22 +3350,32 @@ class NovelWriter(QMainWindow):
         if not path:
             return
         try:
-            nodes = [n for n, _ in self.all_nodes()]
+            nodes_levels = self.all_nodes()
+            nodes = [n for n, _ in nodes_levels]
             if not nodes:
                 nodes = [NovelNode("正文")]
+                nodes_levels = [(nodes[0], 0)]
             book_id = new_id()
             manifest = []
             spine = []
             nav = []
-            for i, n in enumerate(nodes, 1):
+            cur_level = -1
+            for i, (n, level) in enumerate(nodes_levels, 1):
                 href = f"text/chapter{i}.xhtml"
                 manifest.append(
                     f'<item id="chapter{i}" href="{href}" media-type="application/xhtml+xml"/>'
                 )
                 spine.append(f'<itemref idref="chapter{i}"/>')
-                nav.append(
-                    f'<li><a href="{href}">{html.escape(n.title)}</a></li>'
-                )
+                if level > cur_level:
+                    nav.append("<ol>" * (level - cur_level))
+                elif level == cur_level:
+                    nav.append("</li>")
+                else:
+                    nav.append("</li>" + "</ol></li>" * (cur_level - level))
+                nav.append(f'<li><a href="{href}">{html.escape(n.title)}</a>')
+                cur_level = level
+            if cur_level >= 0:
+                nav.append("</li>" + "</ol></li>" * cur_level + "</ol>")
 
             opf = f"""<?xml version="1.0" encoding="UTF-8"?>
 <package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="bookid">
@@ -2615,7 +3396,7 @@ class NovelWriter(QMainWindow):
 <!DOCTYPE html>
 <html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops">
 <head><title>{html.escape(self.current_book.name)}</title></head>
-<body><nav epub:type="toc"><h1>目录</h1><ol>{''.join(nav)}</ol></nav></body>
+<body><nav epub:type="toc"><h1>目录</h1>{''.join(nav)}</nav></body>
 </html>"""
 
             with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
@@ -2653,7 +3434,15 @@ def main():
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
     app.setOrganizationName("InkTree")
-    app.setFont(QFont("Segoe UI", 12))
+    # 界面统一字体：中文用微软雅黑（跟正文默认字体保持一致），英文优先用 Segoe UI。
+    # 用 QFont.setFamilies() 给出一份"按字符回退"的字体列表，通过控件的正常字体
+    # 继承机制作用到全部界面控件上——不依赖样式表。之前用 QSS 的
+    # "*:not(QTextEdit)" 试图排除正文编辑器、只处理界面控件，但 Qt 的
+    # 样式表并不支持对类型选择器使用 :not()，导致这条规则从未生效，
+    # 界面里的中文就只能用 Segoe UI 里没有的字形，被系统换成了宋体。
+    ui_font = QFont("Segoe UI", 12)
+    ui_font.setFamilies(["Segoe UI", "Microsoft YaHei", "微软雅黑"])
+    app.setFont(ui_font)
 
     # 设置程序 Logo：标题栏左上角 + 任务栏图标。
     # 找不到文件时（比如忘了把 assets/LOGO.png 放到 exe 旁边）就跳过，
