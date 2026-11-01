@@ -121,7 +121,7 @@ Papyrus 是本地写作软件，正文、章节结构与写作数据默认保存
 git clone https://github.com/euclase2333/Papyrus.git
 cd Papyrus
 pip install PySide6
-python Papyrus_0.9.0.0.py
+python Papyrus_0.9.1.0.py
 ```
 
 ---
@@ -131,7 +131,7 @@ python Papyrus_0.9.0.0.py
 ```text
 Papyrus/
 │
-├─ Papyrus_0.9.0.0.py       # 主入口
+├─ Papyrus_0.9.1.0.py       # 主入口
 ├─ config.py                # 常量与配置
 ├─ models.py                # 数据模型
 ├─ tree_model.py            # 大纲树模型
@@ -167,7 +167,7 @@ pip install pyinstaller
 打包：
 
 ```bash
-pyinstaller --noconfirm --windowed --icon "Papyrus.ico" --name "Papyrus_0.9.0.0" Papyrus_0.9.0.0.py
+pyinstaller --noconfirm --windowed --icon "Papyrus.ico" --name "Papyrus_0.9.1.0" Papyrus_0.9.1.0.py
 ```
 
 打包完成后，将 `assets/` 目录复制到生成的 exe 同级目录下，即可得到便携式发行版本。
@@ -298,7 +298,7 @@ No Python installation required. Download the release, extract, and run `Papyrus
 git clone https://github.com/euclase2333/Papyrus.git
 cd Papyrus
 pip install PySide6
-python Papyrus_0.9.0.0.py
+python Papyrus_0.9.1.0.py
 ```
 
 ---
@@ -308,7 +308,7 @@ python Papyrus_0.9.0.0.py
 ```text
 Papyrus/
 │
-├─ Papyrus_0.9.0.0.py
+├─ Papyrus_0.9.1.0.py
 ├─ config.py
 ├─ models.py
 ├─ tree_model.py
@@ -341,7 +341,7 @@ pip install pyinstaller
 Build:
 
 ```bash
-pyinstaller --noconfirm --windowed --icon "Papyrus.ico" --name "Papyrus_0.9.0.0" Papyrus_0.9.0.0.py
+pyinstaller --noconfirm --windowed --icon "Papyrus.ico" --name "Papyrus_0.9.1.0" Papyrus_0.9.1.0.py
 ```
 
 After building, copy the `assets/` directory next to the generated executable.

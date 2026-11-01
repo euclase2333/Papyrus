@@ -28,7 +28,7 @@ from PySide6.QtWidgets import (
 from config import APP_DIR, APP_NAME, new_id, now_string
 from models import DataManager, NovelBook, NovelNode, NovelShelf
 from tree_model import NovelTreeModel
-from widgets import FontComboBox, RoundedComboBox, _rounded_region
+from widgets import FontComboBox, NovelTextEdit, NovelTreeView, RoundedComboBox, _rounded_region
 from dialogs import GlobalSearchDialog, SettingsDialog
 from html_utils import compact_richtext_html, html_to_plain
 
@@ -126,7 +126,8 @@ class NovelWriter(QMainWindow):
 
         self.tree_model = NovelTreeModel(self)
         self.tree_model.set_roots(self.data.shelves)
-        self.tree = QTreeView()
+        # 用自绘展开箭头的树：默认箭头不跟随主题色，见 widgets.NovelTreeView。
+        self.tree = NovelTreeView()
         self.tree.setModel(self.tree_model)
         # 拖拽等操作内部用 beginResetModel/endResetModel 刷新整棵树，
         # 会导致视图丢失展开状态、全部折叠收拢；这里在重置前后自动
@@ -230,7 +231,8 @@ class NovelWriter(QMainWindow):
         self.editor_title.setObjectName("EditorTitle")
         pl.addWidget(self.editor_title)
 
-        self.editor = QTextEdit()
+        # 自绘引用块竖条的编辑器，见 widgets.NovelTextEdit
+        self.editor = NovelTextEdit()
         self.editor.setAcceptRichText(True)
         self.editor.setUndoRedoEnabled(True)
         self.editor.setPlaceholderText("开始写作……")
@@ -295,6 +297,8 @@ class NovelWriter(QMainWindow):
                 self.theme_combo.setItemIcon(i, ui_icons.icon(icon_name, color))
         if hasattr(self, "tree_model"):
             self.tree_model.set_icon_color(color)
+        if hasattr(self, "tree"):
+            self.tree.set_arrow_color(color)
         if hasattr(self, "sidebar_toggle_btn"):
             self._update_sidebar_toggle_icon()
         if hasattr(self, "tab_bar"):
@@ -451,6 +455,12 @@ class NovelWriter(QMainWindow):
         self._refresh_themed_icons()
         self.apply_editor_settings()
         self._refresh_editor_text_colors()
+        # 引用块的淡色也要跟着主题重算：_refresh_editor_text_colors() 会
+        # 把正文按新主题重新解析一遍，之前套上的淡色在那里被剥掉了。
+        self.editor.set_theme(theme)
+        was_blocked = self.editor.blockSignals(True)
+        self.editor.apply_quote_style()
+        self.editor.blockSignals(was_blocked)
 
     def qss_day(self):
         # 注意：Qt Style Sheet 的 :not() 只支持伪状态（如 :hover），不支持像
@@ -494,6 +504,13 @@ class NovelWriter(QMainWindow):
         }
         #DialogTitle { font-size:22px; font-weight:650; }
         #DialogHint { color:#667085; line-height:1.5; }
+        #SearchScopeRow {
+            background:transparent; border:none; border-radius:7px;
+            padding:7px 12px; color:#4A4F58; font-size:15px;
+        }
+        #SearchScopeRow:hover { background:#EEF1F5; }
+        #SearchScopeRow:checked { background:#BFD3F2; color:#222222; font-weight:600; }
+        #SearchScopeRow:disabled { color:#AEB7C5; }
         QTabWidget::pane { border:1px solid #E3E6EA; border-radius:7px; }
         QTabBar::tab { padding:9px 18px; }
         QTabBar::tab:selected { background:#E9EDF3; border-radius:6px; }
@@ -618,6 +635,13 @@ class NovelWriter(QMainWindow):
         }
         #DialogTitle { font-size:22px; font-weight:650; }
         #DialogHint { color:#AAB2C0; }
+        #SearchScopeRow {
+            background:transparent; border:none; border-radius:7px;
+            padding:7px 12px; color:#AAB2C0; font-size:15px;
+        }
+        #SearchScopeRow:hover { background:#282F3A; }
+        #SearchScopeRow:checked { background:#4B566B; color:#FFFFFF; font-weight:600; }
+        #SearchScopeRow:disabled { color:#5A6272; }
         QTabWidget::pane { border:1px solid #303744; border-radius:7px; }
         QTabBar::tab { padding:9px 18px; color:#DDE2EA; }
         QTabBar::tab:selected { background:#282F3A; border-radius:6px; }
@@ -742,6 +766,13 @@ class NovelWriter(QMainWindow):
         }
         #DialogTitle { font-size:22px; font-weight:650; color:#1E3A2A; }
         #DialogHint { color:#4A5A4F; }
+        #SearchScopeRow {
+            background:transparent; border:none; border-radius:7px;
+            padding:7px 12px; color:#33493C; font-size:15px;
+        }
+        #SearchScopeRow:hover { background:#D4EBCC; }
+        #SearchScopeRow:checked { background:#B8D9A8; color:#1E3A2A; font-weight:600; }
+        #SearchScopeRow:disabled { color:#8FA888; }
         QTabWidget::pane { border:1px solid #B8D9A8; border-radius:7px; }
         QTabBar::tab { padding:9px 18px; color:#2C3E50; }
         QTabBar::tab:selected { background:#D4EBCC; border-radius:6px; }
@@ -1319,6 +1350,8 @@ class NovelWriter(QMainWindow):
         finally:
             cursor.endEditBlock()
 
+        # 清格式会把引用段落的淡色一起清掉，这里按当前主题补回来。
+        self.editor.apply_quote_style()
         self.save_current()
         self.set_dirty(True)
 
@@ -1426,6 +1459,8 @@ class NovelWriter(QMainWindow):
         finally:
             cursor.endEditBlock()
         self.editor.setTextCursor(cursor)
+        # 粘贴进来的引用块（上面按来源的缩进重建了边距）同样要套上淡色竖条。
+        self.editor.apply_quote_style()
 
     def _paste_plain(self):
         """粘贴且不使用任何格式：只取剪贴板里的纯文本，格式完全交给光标
@@ -1452,6 +1487,9 @@ class NovelWriter(QMainWindow):
     def load_node(self, node):
         self.current_node = node
         self.loading_content = True
+        # 换章节时上一章的搜索高亮必须清掉：字符位置在新文档里已经无意义，
+        # 留着会把不相干的文字也标成“命中”。
+        self.clear_search_highlight()
         self.editor.blockSignals(True)
         self.editor.setReadOnly(False)
         html_content = node.content or ""
@@ -1461,6 +1499,10 @@ class NovelWriter(QMainWindow):
         html_content = re.sub(r"\s(?:bgcolor|color)\s*=\s*(['\"])[^'\"]*\1", "", html_content, flags=re.I)
         self.editor.setHtml(html_content)
         self.editor.document().setDocumentMargin(0)
+        # 引用段的淡色是渲染态、不写进正文的：上面刚把 color 全剥掉了，
+        # 这里按当前主题重新套一遍（趁信号还屏蔽着，不会触发 textChanged）。
+        self.editor.set_theme(self.data.settings.get("theme", "day"))
+        self.editor.apply_quote_style()
         self.editor.blockSignals(False)
         self.loading_content = False
         self.editor_title.setText(self.display_title(node))
@@ -1827,15 +1869,116 @@ class NovelWriter(QMainWindow):
 
     # ---------- 全局搜索 ----------
     def global_search(self):
-        dlg = GlobalSearchDialog(self.data.all_books(), self)
-        if dlg.exec() == QDialog.Accepted:
-            item = dlg.results.currentItem()
-            if not item:
-                return
-            _, nid = item.data(Qt.UserRole)
-            node = self.data.find_node(nid)
-            if node:
-                self.select_node(node)
+        dlg = GlobalSearchDialog(self.data.all_books(), host=self, parent=self)
+        try:
+            if dlg.exec() == QDialog.Accepted:
+                item = dlg.results.currentItem()
+                if not item:
+                    return
+                _, nid = item.data(Qt.UserRole)
+                node = self.data.find_node(nid)
+                if node:
+                    self.select_node(node)
+        finally:
+            # 搜索期间在本章正文里打的淡色高亮，关掉对话框后就没有意义了。
+            self.clear_search_highlight()
+
+    # ---------- 章节内查找（全局搜索 → 仅当前章节） ----------
+    # 各主题下“命中高亮”的颜色和透明度：淡一点，不要盖住正文本身。
+    SEARCH_HIGHLIGHT_COLORS = {
+        "day": ("#3B6FE0", 40),
+        "night": ("#5B8DEF", 70),
+        "green": ("#3F7D3D", 55),
+    }
+
+    def chapter_matches(self, term, context=16):
+        """在当前章节的编辑器文档里找出所有命中位置。
+
+        用 QTextDocument.find() 而不是 html_to_plain() 里的字符偏移：
+        正文是重新 setHtml 解析出来的，纯文本偏移和文档内真实位置对不上，
+        拿它去 setPosition 会跳到别处。这里拿到的就是文档里的准确位置。
+
+        返回 [(start, length, 行号, 上下文片段), ...]。
+        """
+        if not term or self.current_node is None:
+            return []
+        doc = self.editor.document()
+        found_list = []
+        pos = 0
+        while True:
+            found = doc.find(term, pos)
+            if found.isNull():
+                break
+            start = found.selectionStart()
+            length = found.selectionEnd() - start
+            if length <= 0:
+                break
+            block = doc.findBlock(start)
+            text = block.text()
+            col = start - block.position()
+            a = max(0, col - context)
+            b = min(len(text), col + length + context)
+            snippet = text[a:b]
+            if a > 0:
+                snippet = "…" + snippet
+            if b < len(text):
+                snippet = snippet + "…"
+            found_list.append((start, length, block.blockNumber() + 1, snippet))
+            pos = start + length
+            if len(found_list) >= 2000:      # 防御：极端情况下别把界面卡死
+                break
+        return found_list
+
+    def jump_to_match(self, start, length):
+        """把光标移到命中处并选中关键词，再把它滚到视野偏上的位置。"""
+        doc = self.editor.document()
+        max_pos = max(0, doc.characterCount() - 1)
+        start = max(0, min(start, max_pos))
+        end = max(start, min(start + length, max_pos))
+
+        cursor = self.editor.textCursor()
+        cursor.setPosition(start)
+        cursor.setPosition(end, QTextCursor.KeepAnchor)
+        self.editor.setTextCursor(cursor)
+        self.editor.ensureCursorVisible()
+
+        # ensureCursorVisible 只保证“露出一行”，查找时更希望命中处落在
+        # 视野上方三分之一左右，往下读时上下文更完整。
+        viewport_h = self.editor.viewport().height()
+        rect = self.editor.cursorRect()
+        bar = self.editor.verticalScrollBar()
+        offset = rect.top() - viewport_h // 3
+        if offset > 0 or rect.bottom() > viewport_h:
+            bar.setValue(bar.value() + offset)
+
+    def highlight_search_matches(self, term):
+        """把本章所有命中都淡淡标出来，方便看出“这一页有几处”。"""
+        if not term or self.current_node is None:
+            self.clear_search_highlight()
+            return
+        color, alpha = self.SEARCH_HIGHLIGHT_COLORS.get(
+            self.data.settings.get("theme", "day"), ("#3B6FE0", 40)
+        )
+        bg = QColor(color)
+        bg.setAlpha(alpha)
+        fmt = QTextCharFormat()
+        fmt.setBackground(bg)
+
+        doc = self.editor.document()
+        selections = []
+        for start, length, _, _ in self.chapter_matches(term):
+            sel = QTextEdit.ExtraSelection()
+            cursor = QTextCursor(doc)
+            cursor.setPosition(start)
+            cursor.setPosition(start + length, QTextCursor.KeepAnchor)
+            sel.cursor = cursor
+            sel.format = fmt
+            selections.append(sel)
+        self.editor.setExtraSelections(selections)
+
+    def clear_search_highlight(self):
+        if hasattr(self, "editor"):
+            self.editor.setExtraSelections([])
 
     # ---------- 编辑 ----------
     def editor_changed(self):
@@ -1944,16 +2087,19 @@ class NovelWriter(QMainWindow):
         self.merge_char(f)
 
     def quote(self):
-        c = self.editor.textCursor()
-        fmt = c.blockFormat()
-        fmt.setLeftMargin(28)
-        fmt.setRightMargin(20)
-        fmt.setTopMargin(6)
-        fmt.setBottomMargin(6)
-        c.setBlockFormat(fmt)
-        f = QTextCharFormat()
-        f.setFontItalic(True)
-        c.mergeCharFormat(f)
+        """引用按钮：可以反复切换。
+
+        光标所在段落（或整个选区覆盖的段落）如果全都已经是引用，就取消引用
+        （边距归零、文字颜色回到默认）；否则把选中段落全部设成引用。
+        外观（左侧竖条 + 文字变淡）由 NovelTextEdit 负责，不用斜体。
+        """
+        cursor = self.editor.textCursor()
+        blocks = self.editor.selected_blocks(cursor)
+        if not blocks:
+            return
+        turning_on = not all(self.editor.is_quote_block(b) for b in blocks)
+        self.editor.set_quote(blocks, turning_on)
+        self.editor.setFocus()
 
     def bullet(self):
         self.editor.textCursor().createList(QTextListFormat.ListDisc)
@@ -2314,6 +2460,24 @@ class NovelWriter(QMainWindow):
         rec(self.current_book.tree if self.current_book else [])
         return out
 
+    def _txt_chapter_block(self, node):
+        """把一章拼成纯文本：标题顶格独占一行，空一行，然后正文。
+
+        正文直接取编辑器里的纯文本（html_to_plain），只保留它自己的
+        换行、空格和空行；引用、列表、加粗这些 TXT 里表示不出来的格式
+        一律不带过来（列表项就退化成普通的一行）。章节末尾多余的空白行
+        去掉，避免和章节之间的分隔空行叠成两三个空行。
+        """
+        body = html_to_plain(node.content)
+        lines = body.split("\n")
+        while lines and not lines[-1].strip():
+            lines.pop()
+        body = "\n".join(lines)
+
+        if not body:
+            return node.title
+        return node.title + "\n\n" + body
+
     def export_txt(self):
         if not self.current_book:
             return
@@ -2325,18 +2489,13 @@ class NovelWriter(QMainWindow):
         )
         if not path:
             return
-        lines = [self.current_book.name, "========", ""]
-        for node, level in self.all_nodes():
-            indent = "  " * level
-            lines.append(indent + node.title)
-            lines.append(indent + "-" * max(10, len(node.title)))
-            text = html_to_plain(node.content).strip()
-            if text:
-                lines.extend(indent + x for x in text.splitlines())
-            lines.append("")
+        # 纯文本导出：每一行都从第一个字符开始，不加任何缩进、不加装饰线，
+        # 章节之间只用一个空行隔开。
+        blocks = [self._txt_chapter_block(node) for node, _level in self.all_nodes()]
+        text = "\n\n".join(blocks) + "\n"
         try:
             with open(path, "w", encoding="utf-8") as f:
-                f.write("\n".join(lines))
+                f.write(text)
             QMessageBox.information(self, "导出完成", f"TXT 已保存：\n{path}")
         except Exception as e:
             QMessageBox.critical(self, "导出失败", str(e))

@@ -1,11 +1,13 @@
 # -*- coding: utf-8 -*-
 """Papyrus 对话框：设置对话框、全局搜索对话框。"""
 
-from PySide6.QtCore import Qt
+import ui_icons
+
+from PySide6.QtCore import Qt, QSize
 from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QLabel, QLineEdit, QDialog, QDialogButtonBox,
+    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QDialog, QDialogButtonBox,
     QFormLayout, QMessageBox, QSpinBox, QCheckBox, QComboBox, QTabWidget,
-    QListWidget, QListWidgetItem
+    QListWidget, QListWidgetItem, QPushButton, QButtonGroup, QSizePolicy
 )
 
 from html_utils import html_to_plain
@@ -120,27 +122,148 @@ class SettingsDialog(QDialog):
         QMessageBox.information(self, "设置已修改", "点击“确定”后会立即应用并自动保存。")
 
 
+SCOPE_ALL = "all"
+SCOPE_CHAPTER = "chapter"
+
+
+class _ScopeOption(QPushButton):
+    """搜索范围里的一个选项：前面的“圆圈”用 circle-check / circle-check-big
+    两个图标画——未选中是小对勾圆圈，选中后换成大对勾圆圈。用可勾选的
+    QPushButton 而不是 QRadioButton，是为了不出现 Qt 自带的圆点标记，
+    而且图标和文字之间的间距由按钮自己排，比 QToolButton 稳定。"""
+
+    def __init__(self, text, color_off, color_on, parent=None):
+        super().__init__(text, parent)
+        self.setObjectName("SearchScopeRow")
+        self.setCheckable(True)
+        self.setFlat(True)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setIconSize(QSize(20, 20))
+        self.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
+        self._color_off = color_off
+        self._color_on = color_on
+        self.toggled.connect(self._sync_icon)
+        self._sync_icon(self.isChecked())
+
+    def _sync_icon(self, checked):
+        name = "circle-check-big" if checked else "circle-check"
+        self.setIcon(ui_icons.icon(name, self._color_on if checked else self._color_off))
+
+
 class GlobalSearchDialog(QDialog):
-    def __init__(self, books, parent=None):
+    """全局搜索。
+
+    两种范围：
+    - “搜索全部书籍”：行为跟以前完全一样，一条结果对应一个节点，
+      双击切到该章节并关闭对话框；
+    - “仅当前章节”：在当前编辑器的文档里逐处查找，结果一条对应一次
+      命中（带行号和上下文），单击即跳到该位置并选中关键词，可以用
+      “上一个 / 下一个”连续跳，对话框不关闭。
+    """
+
+    def __init__(self, books, host=None, parent=None):
         super().__init__(parent)
         self.books = books
+        self.host = host
+        self.matches = []          # 本页模式下：[(start, length, 行号, 片段), ...]
+        self._syncing = False      # 填列表时抑制 currentItemChanged 的自动跳转
         self.setWindowTitle("全局搜索")
-        self.resize(720, 520)
+        self.resize(760, 540)
+
         root = QVBoxLayout(self)
+        root.setContentsMargins(20, 18, 20, 16)
+        root.setSpacing(12)
 
         self.query = QLineEdit()
-        self.query.setPlaceholderText("搜索所有书籍的标题和正文……")
+        self.query.setPlaceholderText("搜索关键词……")
+        self.query.returnPressed.connect(self._on_return_pressed)
         root.addWidget(self.query)
 
+        # 搜索范围：两个选项排在同一排
+        color_off, color_on = self._scope_colors()
+        scope_row = QWidget()
+        scope_layout = QHBoxLayout(scope_row)
+        scope_layout.setContentsMargins(0, 0, 0, 0)
+        scope_layout.setSpacing(4)
+
+        self.opt_all = _ScopeOption("搜索全部书籍", color_off, color_on)
+        self.opt_chapter = _ScopeOption("仅当前章节", color_off, color_on)
+        self.scope_group = QButtonGroup(self)
+        self.scope_group.setExclusive(True)
+        self.scope_group.addButton(self.opt_all)
+        self.scope_group.addButton(self.opt_chapter)
+        scope_layout.addWidget(self.opt_all)
+        scope_layout.addWidget(self.opt_chapter)
+        scope_layout.addStretch(1)
+        root.addWidget(scope_row)
+
         self.results = QListWidget()
+        self.results.itemActivated.connect(self._on_item_activated)
+        self.results.currentItemChanged.connect(self._on_current_changed)
         root.addWidget(self.results, 1)
 
-        self.query.textChanged.connect(self.search)
-        self.results.itemDoubleClicked.connect(self.accept)
-        self.search("")
+        bottom = QHBoxLayout()
+        self.prev_btn = QPushButton("上一个")
+        self.next_btn = QPushButton("下一个")
+        self.prev_btn.clicked.connect(lambda: self._step(-1))
+        self.next_btn.clicked.connect(lambda: self._step(1))
+        close_btn = QPushButton("关闭")
+        close_btn.clicked.connect(self.reject)
+        bottom.addWidget(self.prev_btn)
+        bottom.addWidget(self.next_btn)
+        bottom.addStretch(1)
+        bottom.addWidget(close_btn)
+        root.addLayout(bottom)
 
-    def search(self, text):
+        # “仅当前章节”在没打开章节时不可选（否则会是永远为空的结果列表）
+        if not self._has_current_chapter():
+            self.opt_chapter.setEnabled(False)
+            self.opt_chapter.setToolTip("当前没有打开任何章节")
+
+        # 默认选中“搜索全部书籍”
+        self.opt_all.setChecked(True)
+        self.scope_group.buttonToggled.connect(self._on_scope_toggled)
+        self.query.textChanged.connect(self._refresh)
+        self._refresh("")
+        self.query.setFocus()
+
+    # ---------- 范围 ----------
+    def _scope_colors(self):
+        """未选中 / 选中两种状态下圆圈图标的颜色，按当前主题取，
+        强调色沿用各主题章节标签页顶部那条线的颜色。"""
+        theme = "day"
+        if self.host is not None and hasattr(self.host, "data"):
+            theme = self.host.data.settings.get("theme", "day")
+        return {
+            "day": ("#4A4F58", "#3B6FE0"),
+            "night": ("#AAB2C0", "#5B8DEF"),
+            "green": ("#33493C", "#3F7D3D"),
+        }.get(theme, ("#4A4F58", "#3B6FE0"))
+
+    def _has_current_chapter(self):
+        return getattr(self.host, "current_node", None) is not None
+
+    @property
+    def scope(self):
+        return SCOPE_CHAPTER if self.opt_chapter.isChecked() else SCOPE_ALL
+
+    def _on_scope_toggled(self, button, checked):
+        if checked:
+            self._refresh(self.query.text())
+
+    # ---------- 结果列表 ----------
+    def _refresh(self, text):
         self.results.clear()
+        self.matches = []
+        if self.scope == SCOPE_CHAPTER:
+            self._search_chapter(text)
+        else:
+            self._search_all(text)
+            if self.host is not None:          # 离开本页模式时清掉正文里的高亮
+                self.host.clear_search_highlight()
+        self._update_nav_enabled()
+
+    def _search_all(self, text):
         q = text.strip().lower()
         if not q:
             return
@@ -163,3 +286,56 @@ class GlobalSearchDialog(QDialog):
                         self.results.addItem(item)
                     rec(node.children, current_path)
             rec(book.tree, [])
+
+    def _search_chapter(self, text):
+        q = text.strip()
+        if not q or self.host is None:
+            return
+        self.matches = self.host.chapter_matches(q)
+        for start, length, line_no, snippet in self.matches:
+            item = QListWidgetItem(f"行 {line_no}　{snippet}")
+            item.setData(Qt.UserRole, (start, length))
+            self.results.addItem(item)
+        self.host.highlight_search_matches(q)
+        if self.matches:
+            # 输入时就跟着跳到第一处，和 TXT 查找的行为一致；
+            # 此时 _syncing 为真，避免 setCurrentRow 再触发一次重复跳转。
+            self._syncing = True
+            self.results.setCurrentRow(0)
+            self._syncing = False
+            self._jump_row(0)
+
+    def _update_nav_enabled(self):
+        usable = self.scope == SCOPE_CHAPTER and bool(self.matches)
+        self.prev_btn.setEnabled(usable)
+        self.next_btn.setEnabled(usable)
+
+    # ---------- 跳转 ----------
+    def _jump_row(self, row):
+        if not (0 <= row < len(self.matches)) or self.host is None:
+            return
+        start, length = self.matches[row][0], self.matches[row][1]
+        self.host.jump_to_match(start, length)
+
+    def _on_current_changed(self, current, previous):
+        if self._syncing or self.scope != SCOPE_CHAPTER or current is None:
+            return
+        self._jump_row(self.results.row(current))
+
+    def _on_item_activated(self, item):
+        if self.scope == SCOPE_CHAPTER:
+            self._jump_row(self.results.row(item))
+        else:
+            # “搜索全部书籍”保持原样：双击选中结果即关闭，由主窗口切到该章节。
+            self.accept()
+
+    def _step(self, delta):
+        if self.scope != SCOPE_CHAPTER or not self.matches:
+            return
+        row = self.results.currentRow()
+        row = 0 if row < 0 else (row + delta) % len(self.matches)
+        self.results.setCurrentRow(row)
+
+    def _on_return_pressed(self):
+        if self.scope == SCOPE_CHAPTER:
+            self._step(1)
