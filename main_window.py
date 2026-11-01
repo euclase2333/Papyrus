@@ -938,6 +938,8 @@ class NovelWriter(QMainWindow):
         self.editor.setFont(font)
         self.editor.setMaximumWidth(16777215)
         self.editor.setMinimumWidth(0)
+        # 取消引用时要把段落下边距恢复成“段落间距”设置值，同步给编辑器
+        self.editor.paragraph_spacing = float(s.get("paragraph_spacing", 4))
         self._apply_document_palette()
 
         if reflow_paragraphs:

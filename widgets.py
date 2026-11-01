@@ -5,7 +5,8 @@ import ui_icons
 
 from PySide6.QtCore import QPoint, QRectF
 from PySide6.QtGui import (
-    QColor, QPainter, QPainterPath, QPalette, QRegion, QTextCharFormat, QTextCursor
+    QColor, QPainter, QPainterPath, QPalette, QRegion, QTextCharFormat, QTextCursor,
+    QTextFormat,
 )
 from PySide6.QtWidgets import QComboBox, QTextEdit, QTreeView
 
@@ -121,6 +122,9 @@ class NovelTextEdit(QTextEdit):
     BAR_X = 6
     BAR_WIDTH = 3
 
+    # 设成引用时，把段落原本的上边距存进这个自定义属性，取消引用时还原
+    _ORIGINAL_TOP_MARGIN = QTextFormat.UserProperty + 1
+
     # 引用段落使用的边距。这组数值同时是“这是引用”的标记，
     # quote() 按钮和“粘贴带引用的富文本”都用它。
     QUOTE_LEFT_MARGIN = 28
@@ -131,6 +135,9 @@ class NovelTextEdit(QTextEdit):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._theme = "day"
+        # 普通段落的下边距（来自“段落间距”设置）。取消引用时要恢复成这个值，
+        # 由主窗口在应用排版设置时同步过来。
+        self.paragraph_spacing = 4.0
 
     def set_theme(self, theme):
         if theme not in self.QUOTE_BAR_COLORS:
@@ -168,8 +175,10 @@ class NovelTextEdit(QTextEdit):
         """把给定的段落设成引用 / 取消引用。
 
         边距是“这是引用”的唯一标记（竖条和淡色都由它推导），所以取消引用
-        只要把边距归零、再把字符颜色清回默认即可。整段操作包在一个撤销块里，
-        连续切换几次只算一步，不会在撤销栈里堆一堆。
+        只要把边距恢复成普通段落的值、再把字符颜色清回默认即可。
+        注意取消时下边距要恢复成“段落间距”设置值（而不是 0），否则取消
+        引用之后这几段会比其它普通段落挨得更紧，看起来像行距被压小了。
+        整段操作包在一个撤销块里，连续切换几次只算一步，不会在撤销栈里堆一堆。
         """
         color = QColor(self.QUOTE_TEXT_COLORS.get(self._theme, "#6B7280"))
         edit = QTextCursor(self.document())
@@ -179,6 +188,11 @@ class NovelTextEdit(QTextEdit):
                 block_cursor = QTextCursor(block)
                 fmt = block.blockFormat()
                 if on:
+                    # 记住原来的上边距，取消引用时原样还原——不同来源的段落
+                    # 上边距可能不一样（Qt 解析 <p> 会给 12，自己敲出来的是 0），
+                    # 写死成某个值总有一边对不上，看起来就像行距被改小了。
+                    if not fmt.hasProperty(self._ORIGINAL_TOP_MARGIN):
+                        fmt.setProperty(self._ORIGINAL_TOP_MARGIN, fmt.topMargin())
                     fmt.setLeftMargin(self.QUOTE_LEFT_MARGIN)
                     fmt.setRightMargin(self.QUOTE_RIGHT_MARGIN)
                     fmt.setTopMargin(self.QUOTE_TOP_MARGIN)
@@ -186,8 +200,10 @@ class NovelTextEdit(QTextEdit):
                 else:
                     fmt.setLeftMargin(0)
                     fmt.setRightMargin(0)
-                    fmt.setTopMargin(0)
-                    fmt.setBottomMargin(0)
+                    fmt.setTopMargin(float(fmt.property(self._ORIGINAL_TOP_MARGIN) or 0.0))
+                    # 恢复成普通段落的下边距（段落间距设置），不是 0
+                    fmt.setBottomMargin(self.paragraph_spacing)
+                    fmt.clearProperty(self._ORIGINAL_TOP_MARGIN)
                 block_cursor.setBlockFormat(fmt)
 
                 text_cursor = QTextCursor(block)
@@ -238,22 +254,59 @@ class NovelTextEdit(QTextEdit):
 
         # 从视口左上角所在的段落开始，只往下画到视口底部为止，
         # 不用遍历整篇文档。
-        block = self.cursorForPosition(QPoint(1, 1)).block()
+        first = self.cursorForPosition(QPoint(1, 1)).block()
+
+        # 视口上方如果还有同属这段引用的段落，说明这条引用是从上面续下来的，
+        # 顶端就不该再缩进，否则滚动到这里会看到一处断口。
+        prev_block = first.previous()
+        continues_above = (prev_block.isValid() and prev_block.isVisible()
+                           and self.is_quote_block(prev_block))
+
+        rows = []            # [(上边, 下边, 是引用, 有文字), ...]
+        stopped_block = None
+        block = first
         while block.isValid():
             rect = layout.blockBoundingRect(block)
             top = rect.top() - scroll_y
             if top > viewport_height:
+                stopped_block = block
                 break
-            # 空段落不画竖条：删掉引用里的文字后，段落本身还留着，
-            # 但已经没有内容可以“引用”了，留一条孤零零的竖线很怪。
-            if (block.isVisible() and self.is_quote_block(block)
-                    and block.text().strip() and rect.bottom() - scroll_y > 0):
+            rows.append((top, rect.bottom() - scroll_y,
+                         block.isVisible() and self.is_quote_block(block),
+                         bool(block.text().strip())))
+            block = block.next()
+
+        # 视口下方紧跟着的还是引用，说明这条引用没结束，底端也不用缩进
+        continues_below = False
+        if stopped_block is not None:
+            continues_below = (stopped_block.isVisible()
+                               and self.is_quote_block(stopped_block))
+
+        # 把连续的引用段落合并成一条连续的竖线，中间不再断开；
+        # 整段都是空段落（引用里的文字被删光了）时整条不画。
+        total = len(rows)
+        i = 0
+        while i < total:
+            if not rows[i][2]:
+                i += 1
+                continue
+            j = i
+            has_text = False
+            while j < total and rows[j][2]:
+                has_text = has_text or rows[j][3]
+                j += 1
+            if has_text:
+                top = rows[i][0]
+                bottom = rows[j - 1][1]
+                if not (i == 0 and continues_above):
+                    top += 3
+                if not (j == total and continues_below):
+                    bottom -= 3
                 painter.fillRect(
-                    QRectF(self.BAR_X, top + 3, self.BAR_WIDTH,
-                           max(4.0, rect.height() - 6)),
+                    QRectF(self.BAR_X, top, self.BAR_WIDTH, max(4.0, bottom - top)),
                     bar_color,
                 )
-            block = block.next()
+            i = j
         painter.end()
 
 
